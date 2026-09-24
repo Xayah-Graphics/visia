@@ -177,8 +177,8 @@ namespace visia {
             command.draw(6, 1, 0, 0);
         }
 
-        if (canvas.selected) {
-            const auto& picture = canvas.pictures[*canvas.selected];
+        if (canvas.selected && canvas.selected->kind == Selection::Kind::picture) {
+            const auto& picture = canvas.pictures[canvas.selected->index];
             const auto [left, top] = canvas.screen(picture.x, picture.y);
             const float x = static_cast<float>(left * dpi_x), y = static_cast<float>(top * dpi_y);
             const float w = static_cast<float>(picture.width * picture.scale * canvas.zoom * dpi_x);

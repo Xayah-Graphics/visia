@@ -1,0 +1,15 @@
+include_guard(GLOBAL)
+set(VISIA_FONT_DIRECTORY "${PROJECT_BINARY_DIR}/fonts")
+file(MAKE_DIRECTORY "${VISIA_FONT_DIRECTORY}")
+file(DOWNLOAD
+        "https://raw.githubusercontent.com/notofonts/noto-cjk/f8d157532fbfaeda587e826d4cd5b21a49186f7c/Sans/SubsetOTF/SC/NotoSansSC-Regular.otf"
+        "${VISIA_FONT_DIRECTORY}/NotoSansSC-Regular.otf"
+        EXPECTED_HASH SHA256=FAA6C9DF652116DDE789D351359F3D7E5D2285A2B2A1F04A2D7244DF706D5EA9)
+file(DOWNLOAD
+        "https://raw.githubusercontent.com/notofonts/noto-cjk/f8d157532fbfaeda587e826d4cd5b21a49186f7c/Sans/SubsetOTF/SC/NotoSansSC-Bold.otf"
+        "${VISIA_FONT_DIRECTORY}/NotoSansSC-Bold.otf"
+        EXPECTED_HASH SHA256=C6CB5A93ABAA9EDC8EE7463B7EBB7F42D618D40E6ED2F7A5371C97B0B64767C0)
+file(DOWNLOAD
+        "https://raw.githubusercontent.com/notofonts/noto-cjk/f8d157532fbfaeda587e826d4cd5b21a49186f7c/Sans/LICENSE"
+        "${VISIA_FONT_DIRECTORY}/NotoCJK-LICENSE.txt"
+        EXPECTED_HASH SHA256=6A73F9541C2DE74158C0E7CF6B0A58EF774F5A780BF191F2D7EC9CC53EFE2BF2)

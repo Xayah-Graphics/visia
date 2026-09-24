@@ -3,6 +3,7 @@ module;
 #include <GLFW/glfw3.h>
 #include <nfd.h>
 #include <imgui.h>
+#include <imgui_stdlib.h>
 #include <imgui_impl_glfw.h>
 #include <imgui_impl_vulkan.h>
 
@@ -14,12 +15,26 @@ import visia.window;
 import std;
 
 namespace visia {
+    namespace {
+        std::filesystem::path executable_directory() {
+            std::wstring executable(32768, L'\0');
+            executable.resize(GetModuleFileNameW(nullptr, executable.data(), static_cast<DWORD>(executable.size())));
+            return std::filesystem::path{executable}.parent_path();
+        }
+    }
+
     Application::UiLifetime::UiLifetime() {
         ImGui::CreateContext();
         auto& io = ImGui::GetIO();
         io.IniFilename = nullptr;
         io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
         io.Fonts->AddFontFromFileTTF("C:/Windows/Fonts/SegUIVar.ttf");
+        constexpr std::array names{L"NotoSansSC-Regular.otf", L"NotoSansSC-Bold.otf"};
+        for (std::size_t weight = 0; weight < names.size(); ++weight) {
+            const auto path = (executable_directory() / names[weight]).u8string();
+            text_fonts[weight] = io.Fonts->AddFontFromFileTTF(reinterpret_cast<const char*>(path.c_str()));
+            if (!text_fonts[weight]) throw std::runtime_error{"Cannot load Visia text font"};
+        }
         ImGui::StyleColorsDark();
         auto& style = ImGui::GetStyle();
         style.WindowRounding = 14;
@@ -83,25 +98,46 @@ namespace visia {
         });
         glfwSetCursorPosCallback(source, [](GLFWwindow* source, const double x, const double y) {
             auto& app = *static_cast<Application*>(glfwGetWindowUserPointer(source));
-            if (app.pending == Action::none && app.error.empty() && !ImGui::GetIO().WantCaptureMouse) app.canvas.move(x, y);
+            if (app.pending == Action::none && app.error.empty() && !app.editing && !ImGui::GetIO().WantCaptureMouse) app.canvas.move(x, y);
             app.redraw = true;
         });
-        glfwSetMouseButtonCallback(source, [](GLFWwindow* source, const int button, const int action, int) {
+        glfwSetMouseButtonCallback(source, [](GLFWwindow* source, const int button, const int action, const int modifiers) {
             auto& app = *static_cast<Application*>(glfwGetWindowUserPointer(source));
             app.redraw = true;
-            if (action == GLFW_RELEASE) {
-                app.canvas.release();
-                return;
-            }
-            if (app.pending != Action::none || !app.error.empty() || ImGui::GetIO().WantCaptureMouse) return;
             double x{}, y{};
             glfwGetCursorPos(source, &x, &y);
-            if (action == GLFW_PRESS) app.canvas.press(x, y, button);
+            const bool inside_inspector = app.inspector_visible &&
+                x >= app.inspector_bounds[0] && y >= app.inspector_bounds[1] &&
+                x <= app.inspector_bounds[2] && y <= app.inspector_bounds[3];
+            if (action == GLFW_RELEASE) {
+                app.canvas.release();
+                if (button == GLFW_MOUSE_BUTTON_LEFT && !inside_inspector && !app.editing && !ImGui::GetIO().WantCaptureMouse) {
+                    app.inspector_visible = app.canvas.selected && app.canvas.selected->kind == Selection::Kind::text;
+                }
+                return;
+            }
+            if (action == GLFW_PRESS && button == GLFW_MOUSE_BUTTON_LEFT && app.editing) {
+                const auto& text = app.canvas.texts[*app.editing];
+                const auto [left, top] = app.canvas.screen(text.x, text.y);
+                const double width = (text.width + (text.auto_width ? text.font_size : 0)) * app.canvas.zoom;
+                const double height = text.height * app.canvas.zoom;
+                if (x < left || y < top || x > left + width || y > top + height) {
+                    app.finish_edit(true);
+                    app.canvas.selected.reset();
+                    app.inspector_visible = false;
+                }
+                return;
+            }
+            if (button == GLFW_MOUSE_BUTTON_LEFT && inside_inspector) return;
+            if (app.pending != Action::none || !app.error.empty() || app.editing || ImGui::GetIO().WantCaptureMouse) return;
+            if (action != GLFW_PRESS) return;
+            if (button == GLFW_MOUSE_BUTTON_LEFT) app.inspector_visible = false;
+            if (button == GLFW_MOUSE_BUTTON_LEFT || button == GLFW_MOUSE_BUTTON_MIDDLE) app.canvas.press(x, y, button, (modifiers & GLFW_MOD_ALT) != 0);
         });
         glfwSetScrollCallback(source, [](GLFWwindow* source, double, const double steps) {
             auto& app = *static_cast<Application*>(glfwGetWindowUserPointer(source));
             app.redraw = true;
-            if (app.pending != Action::none || !app.error.empty() || ImGui::GetIO().WantCaptureMouse) return;
+            if (app.pending != Action::none || !app.error.empty() || app.editing || ImGui::GetIO().WantCaptureMouse) return;
             double x{}, y{};
             glfwGetCursorPos(source, &x, &y);
             app.canvas.wheel(x, y, steps);
@@ -109,55 +145,21 @@ namespace visia {
         glfwSetDropCallback(source, [](GLFWwindow* source, const int count, const char** paths) {
             auto& app = *static_cast<Application*>(glfwGetWindowUserPointer(source));
             if (app.pending != Action::none || !app.error.empty()) return;
-            try {
-                std::vector<std::filesystem::path> files;
-                files.reserve(count);
-                for (int index = 0; index < count; ++index) files.emplace_back(std::u8string{reinterpret_cast<const char8_t*>(paths[index])});
-                const auto document = std::ranges::find_if(files, [](const std::filesystem::path& file) {
-                    auto extension = file.extension().wstring();
-                    for (auto& letter : extension) if (letter >= L'A' && letter <= L'Z') letter += L'a' - L'A';
-                    return extension == L".visia";
-                });
-                if (document != files.end()) {
-                    if (files.size() != 1) throw std::runtime_error{"Drop one .visia document at a time, without PNG images"};
-                    app.request(Action::open, *document);
-                    return;
-                }
-                std::vector<Picture> pictures;
-                for (const auto& file : files) pictures.push_back(read_png(file));
-                double x{}, y{};
-                glfwGetCursorPos(source, &x, &y);
-                auto position = app.canvas.world(x, y);
-                for (auto& picture : pictures) {
-                    app.canvas.add(std::move(picture.png), picture.width, picture.height, position[0], position[1]);
-                    const auto& placed = app.canvas.pictures.back();
-                    position[0] = Canvas::snap(placed.x + placed.width * placed.scale) + Canvas::grid;
-                }
-                app.canvas.normalize();
-                app.redraw = true;
-            } catch (const std::exception& failure) {
-                app.error = failure.what();
-                app.redraw = true;
-            }
+            app.dropped_files.clear();
+            for (int index = 0; index < count; ++index) app.dropped_files.emplace_back(std::u8string{reinterpret_cast<const char8_t*>(paths[index])});
+            glfwGetCursorPos(source, &app.drop_position[0], &app.drop_position[1]);
+            app.redraw = true;
         });
         glfwSetKeyCallback(source, [](GLFWwindow* source, const int key, int, const int action, const int modifiers) {
             if (action != GLFW_PRESS) return;
             auto& app = *static_cast<Application*>(glfwGetWindowUserPointer(source));
             app.redraw = true;
-            if (key == GLFW_KEY_ESCAPE && !(modifiers & (GLFW_MOD_CONTROL | GLFW_MOD_SHIFT | GLFW_MOD_ALT | GLFW_MOD_SUPER)) && app.pending == Action::none && app.error.empty()) {
-                app.request(Action::close);
-                return;
-            }
-            if (key == GLFW_KEY_F && !(modifiers & (GLFW_MOD_CONTROL | GLFW_MOD_SHIFT | GLFW_MOD_ALT | GLFW_MOD_SUPER)) && app.pending == Action::none && app.error.empty()) {
-                app.canvas.fit();
-                return;
-            }
-            if (app.pending != Action::none || !app.error.empty() || key != GLFW_KEY_S || !(modifiers & GLFW_MOD_CONTROL) || (modifiers & (GLFW_MOD_SHIFT | GLFW_MOD_ALT | GLFW_MOD_SUPER))) return;
-            try {
-                app.save();
-            } catch (const std::exception& failure) {
-                app.error = failure.what();
-            }
+            if (app.pending != Action::none || !app.error.empty() || (modifiers & (GLFW_MOD_SHIFT | GLFW_MOD_ALT | GLFW_MOD_SUPER))) return;
+            if (key == GLFW_KEY_ESCAPE && !(modifiers & GLFW_MOD_CONTROL) && app.editing) app.shortcut = Shortcut::cancel_edit;
+            else if (key == GLFW_KEY_F11 && !(modifiers & GLFW_MOD_CONTROL)) app.window.toggle_fullscreen();
+            else if (key == GLFW_KEY_W && (modifiers & GLFW_MOD_CONTROL)) app.shortcut = Shortcut::close;
+            else if (key == GLFW_KEY_S && (modifiers & GLFW_MOD_CONTROL)) app.shortcut = Shortcut::save;
+            else if (key == GLFW_KEY_F && !(modifiers & GLFW_MOD_CONTROL) && !app.editing) app.shortcut = Shortcut::fit;
         });
         ui.attach(source);
         glfwShowWindow(source);
@@ -167,6 +169,7 @@ namespace visia {
         Canvas opened = open_document(path);
         renderer.clear();
         canvas = std::move(opened);
+        inspector_visible = false;
         int width{}, height{};
         glfwGetWindowSize(window.handle.get(), &width, &height);
         canvas.viewport_width = width;
@@ -178,9 +181,7 @@ namespace visia {
     bool Application::save() {
         auto destination = canvas.path;
         if (destination.empty()) {
-            std::wstring executable(32768, L'\0');
-            executable.resize(GetModuleFileNameW(nullptr, executable.data(), static_cast<DWORD>(executable.size())));
-            const auto directory = std::filesystem::path{executable}.parent_path().u8string();
+            const auto directory = executable_directory().u8string();
             nfdu8char_t* selected{};
             const nfdu8filteritem_t filter{"Visia document", "visia"};
             const auto result = NFD_SaveDialogU8(&selected, &filter, 1, reinterpret_cast<const nfdu8char_t*>(directory.c_str()), "Untitled.visia");
@@ -192,6 +193,67 @@ namespace visia {
         save_document(canvas, destination);
         update_title();
         return true;
+    }
+
+    void Application::start_edit(const std::size_t index, const bool created) {
+        editing = index;
+        original_text = canvas.texts[index].content;
+        new_text = created;
+        focus_text = true;
+        canvas.selected = Selection{Selection::Kind::text, index};
+        inspector_visible = false;
+        canvas.release();
+        redraw = true;
+    }
+
+    void Application::finish_edit(const bool commit) {
+        if (!editing) return;
+        const std::size_t index = *editing;
+        auto& text = canvas.texts[index];
+        const bool remove = (new_text && !commit) || (commit && text.content.empty());
+        if (!commit && !new_text) text.content = original_text;
+        if (remove) {
+            canvas.texts.erase(canvas.texts.begin() + static_cast<std::ptrdiff_t>(index));
+            canvas.selected.reset();
+            canvas.normalize();
+            if (commit && !new_text) canvas.dirty = true;
+        } else if (commit && (new_text || text.content != original_text)) canvas.dirty = true;
+        inspector_visible = !remove;
+        editing.reset();
+        original_text.clear();
+        new_text = false;
+        focus_text = false;
+        redraw = true;
+    }
+
+    void Application::handle_drop() {
+        auto files = std::exchange(dropped_files, {});
+        inspector_visible = false;
+        try {
+            const auto document = std::ranges::find_if(files, [](const std::filesystem::path& file) {
+                auto extension = file.extension().wstring();
+                for (auto& letter : extension) if (letter >= L'A' && letter <= L'Z') letter += L'a' - L'A';
+                return extension == L".visia";
+            });
+            if (document != files.end()) {
+                if (files.size() != 1) throw std::runtime_error{"Drop one .visia document at a time, without PNG images"};
+                request(Action::open, *document);
+                return;
+            }
+            std::vector<Picture> pictures;
+            for (const auto& file : files) pictures.push_back(read_png(file));
+            auto position = canvas.world(drop_position[0], drop_position[1]);
+            for (auto& picture : pictures) {
+                canvas.add(std::move(picture.png), picture.width, picture.height, position[0], position[1]);
+                const auto& placed = canvas.pictures.back();
+                position[0] = Canvas::snap(placed.x + placed.width * placed.scale) + Canvas::grid;
+            }
+            canvas.normalize();
+            redraw = true;
+        } catch (const std::exception& failure) {
+            error = failure.what();
+            redraw = true;
+        }
     }
 
     void Application::request(const Action action, std::filesystem::path document) {
@@ -222,19 +284,292 @@ namespace visia {
     }
 
     void Application::draw_ui() {
+        const auto command = std::exchange(shortcut, Shortcut::none);
         ui.begin(window.handle.get());
         const auto& io = ImGui::GetIO();
-        if (canvas.pictures.empty() && pending == Action::none && error.empty()) {
+        const auto font_for = [&](const TextBlock& text) {
+            return ui.text_fonts[static_cast<std::size_t>(text.weight)];
+        };
+        const auto measure = [&](TextBlock& text) {
+            ImGui::PushFont(font_for(text), static_cast<float>(text.font_size / ui.scale));
+            const auto size = ImGui::CalcTextSize(text.content.empty() ? " " : text.content.c_str(), nullptr, false, text.auto_width ? -1.0F : static_cast<float>(text.width));
+            if (text.auto_width) text.width = std::max(static_cast<double>(text.font_size), static_cast<double>(size.x));
+            const double next_line = text.content.ends_with('\n') ? ImGui::GetFontSize() : 0;
+            text.height = std::max(static_cast<double>(text.font_size), size.y + next_line);
+            ImGui::PopFont();
+        };
+        for (auto& text : canvas.texts) measure(text);
+
+        if (!editing && pending == Action::none && error.empty() && !io.KeyAlt && !io.WantCaptureMouse && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+            const auto [world_x, world_y] = canvas.world(io.MousePos.x, io.MousePos.y);
+            if (const auto hit = canvas.text_at(world_x, world_y)) start_edit(*hit, false);
+            else {
+                bool on_picture{};
+                for (const auto& picture : canvas.pictures)
+                    if (world_x >= picture.x && world_y >= picture.y && world_x <= picture.x + picture.width * picture.scale && world_y <= picture.y + picture.height * picture.scale) on_picture = true;
+                if (!on_picture) {
+                    canvas.add_text(world_x, world_y);
+                    canvas.normalize();
+                    start_edit(canvas.texts.size() - 1, true);
+                }
+            }
+        }
+        if (editing) {
+            auto& text = canvas.texts[*editing];
+            const auto [x, y] = canvas.screen(text.x, text.y);
+            const ImVec2 size{static_cast<float>((text.width + (text.auto_width ? text.font_size : 0)) * canvas.zoom), static_cast<float>(text.height * canvas.zoom)};
+            ImGui::SetNextWindowPos({static_cast<float>(x), static_cast<float>(y)});
+            ImGui::SetNextWindowSize(size);
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {0, 0});
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0F);
+            ImGui::Begin("##TextEditor", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoBackground);
+            ImGui::PopStyleVar(2);
+            ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4{0, 0, 0, 0});
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4{text.color[0] / 255.0F, text.color[1] / 255.0F, text.color[2] / 255.0F, 1});
+            ImGui::PushStyleColor(ImGuiCol_NavCursor, ImVec4{0, 0, 0, 0});
+            ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, {0, 0});
+            ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 0.0F);
+            ImGui::PushStyleVar(ImGuiStyleVar_ScrollbarSize, 0.0F);
+            ImGui::PushFont(font_for(text), static_cast<float>(text.font_size * canvas.zoom / ui.scale));
+            if (focus_text && !ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+                ImGui::SetKeyboardFocusHere();
+                focus_text = false;
+            }
+            const ImGuiInputTextFlags flags = ImGuiInputTextFlags_NoHorizontalScroll | (text.auto_width ? ImGuiInputTextFlags_None : ImGuiInputTextFlags_WordWrap);
+            if (ImGui::InputTextMultiline("##Content", &text.content, size, flags)) {
+                measure(text);
+                redraw = true;
+            }
+            ImGui::PopFont();
+            ImGui::PopStyleVar(3);
+            ImGui::PopStyleColor(3);
+            ImGui::End();
+        }
+
+        if (command == Shortcut::cancel_edit) finish_edit(false);
+        if (command == Shortcut::save || command == Shortcut::close) finish_edit(true);
+        if (command == Shortcut::fit) canvas.fit();
+        if (command == Shortcut::close) request(Action::close);
+        if (command == Shortcut::save) {
+            try {
+                save();
+            } catch (const std::exception& failure) {
+                error = failure.what();
+            }
+        }
+        if (running && !dropped_files.empty() && pending == Action::none && error.empty()) {
+            finish_edit(true);
+            handle_drop();
+        }
+
+        auto* background = ImGui::GetBackgroundDrawList();
+        for (std::size_t index = 0; index < canvas.texts.size(); ++index) {
+            if (editing && *editing == index) continue;
+            const auto& text = canvas.texts[index];
+            const auto [x, y] = canvas.screen(text.x, text.y);
+            const float width = static_cast<float>(text.width * canvas.zoom), height = static_cast<float>(text.height * canvas.zoom);
+            if (x + width < 0 || y + height < 0 || x > io.DisplaySize.x || y > io.DisplaySize.y) continue;
+            ImFont* font = font_for(text);
+            ImGui::PushFont(font, static_cast<float>(text.font_size * canvas.zoom / ui.scale));
+            const ImVec2 position{static_cast<float>(x), static_cast<float>(y)};
+            const float font_size = ImGui::GetFontSize();
+            const char* line = text.content.data();
+            const char* end = line + text.content.size();
+            float line_y = position.y;
+            while (line < end) {
+                const char* newline = std::find(line, end, '\n');
+                const char* line_end = text.auto_width ? newline : font->CalcWordWrapPosition(font_size, line, newline, width);
+                const float line_width = ImGui::CalcTextSize(line, line_end).x;
+                const float remaining = std::max(0.0F, width - line_width);
+                float line_x = position.x;
+                if (text.alignment == TextBlock::Alignment::center) line_x += remaining / 2;
+                if (text.alignment == TextBlock::Alignment::right) line_x += remaining;
+                background->AddText(font, font_size, {line_x + ui.scale, line_y + ui.scale}, IM_COL32(0, 0, 0, 160), line, line_end);
+                background->AddText(font, font_size, {line_x, line_y}, IM_COL32(text.color[0], text.color[1], text.color[2], 255), line, line_end);
+                if (line_end == newline) line = newline < end ? newline + 1 : end;
+                else {
+                    line = line_end;
+                    while (line < newline && (*line == ' ' || *line == '\t')) ++line;
+                    if (line == newline && newline < end) ++line;
+                }
+                line_y += font_size;
+            }
+            ImGui::PopFont();
+            if (canvas.selected && canvas.selected->kind == Selection::Kind::text && canvas.selected->index == index) {
+                background->AddRect({static_cast<float>(x), static_cast<float>(y)}, {static_cast<float>(x) + width, static_cast<float>(y) + height}, IM_COL32(122, 139, 180, 220), 2 * ui.scale);
+                const ImVec2 handle{static_cast<float>(x) + width, static_cast<float>(y) + height / 2};
+                background->AddCircleFilled(handle, 4 * ui.scale, IM_COL32(174, 187, 218, 245));
+            }
+        }
+
+        if (inspector_visible && !editing && canvas.selected && canvas.selected->kind == Selection::Kind::text && pending == Action::none && error.empty()) {
+            const std::size_t index = canvas.selected->index;
+            auto& text = canvas.texts[index];
+            const auto [screen_x, screen_y] = canvas.screen(text.x, text.y);
+            const float width = 300 * ui.scale, height = 80 * ui.scale;
+            const float x = std::clamp(static_cast<float>(screen_x + text.width * canvas.zoom / 2 - width / 2), 16 * ui.scale, std::max(16 * ui.scale, io.DisplaySize.x - width - 16 * ui.scale));
+            const float above = static_cast<float>(screen_y) - height - 10 * ui.scale;
+            const float below = static_cast<float>(screen_y + text.height * canvas.zoom) + 10 * ui.scale;
+            const float y = std::clamp(above >= 16 * ui.scale ? above : below, 16 * ui.scale, std::max(16 * ui.scale, io.DisplaySize.y - height - 16 * ui.scale));
+            inspector_bounds = {x, y, x + width, y + height};
+            background->AddRectFilled({x, y + 3 * ui.scale}, {x + width, y + height + 3 * ui.scale}, IM_COL32(0, 0, 0, 35), 10 * ui.scale);
+            ImGui::SetNextWindowPos({x, y});
+            ImGui::SetNextWindowSize({width, height});
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2{8 * ui.scale, 7 * ui.scale});
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 10 * ui.scale);
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, ui.scale);
+            ImGui::PushStyleVar(ImGuiStyleVar_PopupRounding, 9 * ui.scale);
+            ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6 * ui.scale);
+            ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2{7 * ui.scale, 5 * ui.scale});
+            ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2{6 * ui.scale, 6 * ui.scale});
+            ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4{0.12F, 0.13F, 0.16F, 0.98F});
+            ImGui::PushStyleColor(ImGuiCol_Border, ImVec4{0.32F, 0.34F, 0.39F, 0.8F});
+            ImGui::PushStyleColor(ImGuiCol_PopupBg, ImVec4{0.12F, 0.13F, 0.16F, 0.99F});
+            ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4{0.18F, 0.19F, 0.23F, 1});
+            ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, ImVec4{0.22F, 0.23F, 0.28F, 1});
+            ImGui::PushStyleColor(ImGuiCol_FrameBgActive, ImVec4{0.26F, 0.27F, 0.33F, 1});
+            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4{0.12F, 0.13F, 0.16F, 1});
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4{0.22F, 0.23F, 0.28F, 1});
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4{0.28F, 0.30F, 0.37F, 1});
+            bool style_changed{}, delete_text{};
+            ImGui::Begin("##TextInspector", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoResize);
+            const bool clicked_canvas = ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
+                !ImGui::IsWindowHovered(ImGuiHoveredFlags_AnyWindow) &&
+                (io.MousePos.x < inspector_bounds[0] || io.MousePos.y < inspector_bounds[1] ||
+                    io.MousePos.x > inspector_bounds[2] || io.MousePos.y > inspector_bounds[3]);
+            constexpr std::array sizes{
+                std::pair{"H1", 192},
+                std::pair{"H2", 128},
+                std::pair{"Body", 96},
+                std::pair{"Caption", 64}
+            };
+            const float preset_width = (width - 28 * ui.scale) / 4;
+            for (std::size_t option = 0; option < sizes.size(); ++option) {
+                if (option) ImGui::SameLine(0, 4 * ui.scale);
+                const auto& [name, size] = sizes[option];
+                const bool selected = text.font_size == size;
+                if (selected) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4{0.31F, 0.35F, 0.45F, 1});
+                if (ImGui::Button(name, ImVec2{preset_width, 28 * ui.scale}) && !selected) {
+                    text.font_size = size;
+                    style_changed = true;
+                }
+                if (selected) ImGui::PopStyleColor();
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("%d canvas units", size);
+            }
+            ImGui::SetCursorPosX(27 * ui.scale);
+            const bool bold = text.weight == TextBlock::Weight::bold;
+            if (bold) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4{0.31F, 0.35F, 0.45F, 1});
+            if (ImGui::Button("B", ImVec2{30 * ui.scale, 0})) {
+                text.weight = bold ? TextBlock::Weight::regular : TextBlock::Weight::bold;
+                style_changed = true;
+            }
+            if (bold) ImGui::PopStyleColor();
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Bold");
+            ImGui::SameLine();
+            if (ImGui::InvisibleButton("##Color", ImVec2{28 * ui.scale, 28 * ui.scale})) ImGui::OpenPopup("##TextColor");
+            const ImVec2 color_center{(ImGui::GetItemRectMin().x + ImGui::GetItemRectMax().x) / 2, (ImGui::GetItemRectMin().y + ImGui::GetItemRectMax().y) / 2};
+            if (ImGui::IsItemHovered()) {
+                ImGui::GetWindowDrawList()->AddRectFilled(ImGui::GetItemRectMin(), ImGui::GetItemRectMax(), IM_COL32(58, 61, 72, 255), 6 * ui.scale);
+                ImGui::SetTooltip("Text color");
+            }
+            ImGui::GetWindowDrawList()->AddCircleFilled(color_center, 7 * ui.scale, IM_COL32(text.color[0], text.color[1], text.color[2], 255));
+            ImGui::GetWindowDrawList()->AddCircle(color_center, 7 * ui.scale, IM_COL32(17, 19, 25, 255));
+            constexpr std::array hints{"Align left", "Align center", "Align right"};
+            constexpr std::array strokes{14.0F, 9.0F, 12.0F, 7.0F};
+            for (int option = 0; option < 3; ++option) {
+                ImGui::SameLine(0, option == 0 ? 6 * ui.scale : 2 * ui.scale);
+                ImGui::PushID(option);
+                const bool selected = text.alignment == static_cast<TextBlock::Alignment>(option);
+                if (selected) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4{0.31F, 0.35F, 0.45F, 1});
+                if (ImGui::Button("##Alignment", ImVec2{26 * ui.scale, 28 * ui.scale})) {
+                    text.alignment = static_cast<TextBlock::Alignment>(option);
+                    style_changed = true;
+                }
+                if (selected) ImGui::PopStyleColor();
+                const bool hovered = ImGui::IsItemHovered();
+                const auto top_left = ImGui::GetItemRectMin();
+                const ImU32 ink = selected || hovered ? IM_COL32(235, 238, 247, 255) : IM_COL32(151, 156, 172, 255);
+                for (std::size_t row = 0; row < strokes.size(); ++row) {
+                    const float length = strokes[row] * ui.scale;
+                    float inset{};
+                    if (option == 1) inset = (14 * ui.scale - length) / 2;
+                    if (option == 2) inset = 14 * ui.scale - length;
+                    const float left = top_left.x + 6 * ui.scale + inset;
+                    const float line_y = top_left.y + (6 + row * 5) * ui.scale;
+                    ImGui::GetWindowDrawList()->AddLine({left, line_y}, {left + length, line_y}, ink, 1.5F * ui.scale);
+                }
+                if (hovered) ImGui::SetTooltip("%s", hints[option]);
+                ImGui::PopID();
+            }
+            ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2{6 * ui.scale, 8 * ui.scale});
+            if (ImGui::BeginPopup("##TextColor")) {
+                ImGui::TextDisabled("TEXT COLOR");
+                constexpr std::array palette{
+                    std::array<std::uint8_t, 3>{219, 221, 231},
+                    std::array<std::uint8_t, 3>{250, 250, 250},
+                    std::array<std::uint8_t, 3>{245, 204, 156},
+                    std::array<std::uint8_t, 3>{241, 199, 91},
+                    std::array<std::uint8_t, 3>{142, 222, 187},
+                    std::array<std::uint8_t, 3>{139, 184, 240}
+                };
+                for (std::size_t choice = 0; choice < palette.size(); ++choice) {
+                    ImGui::PushID(static_cast<int>(choice));
+                    if (choice) ImGui::SameLine();
+                    const auto& color = palette[choice];
+                    if (ImGui::ColorButton("##Color", ImVec4{color[0] / 255.0F, color[1] / 255.0F, color[2] / 255.0F, 1}, ImGuiColorEditFlags_NoTooltip, ImVec2{24 * ui.scale, 24 * ui.scale})) {
+                        text.color = color;
+                        style_changed = true;
+                    }
+                    if (text.color == color) ImGui::GetWindowDrawList()->AddRect(ImGui::GetItemRectMin(), ImGui::GetItemRectMax(), IM_COL32(242, 243, 248, 255), 5 * ui.scale);
+                    ImGui::PopID();
+                }
+                ImGui::Separator();
+                float color[3]{text.color[0] / 255.0F, text.color[1] / 255.0F, text.color[2] / 255.0F};
+                ImGui::SetNextItemWidth(210 * ui.scale);
+                if (ImGui::ColorPicker3("##RGB", color, ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_NoSidePreview | ImGuiColorEditFlags_NoSmallPreview)) {
+                    for (int channel = 0; channel < 3; ++channel) text.color[channel] = static_cast<std::uint8_t>(std::lround(color[channel] * 255));
+                    style_changed = true;
+                }
+                ImGui::EndPopup();
+            }
+            ImGui::PopStyleVar();
+            ImGui::SameLine();
+            ImGui::TextDisabled("|");
+            ImGui::SameLine();
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4{0.87F, 0.56F, 0.56F, 1});
+            delete_text = ImGui::Button("Delete", ImVec2{54 * ui.scale, 0});
+            ImGui::PopStyleColor();
+            ImGui::End();
+            ImGui::PopStyleColor(9);
+            ImGui::PopStyleVar(7);
+            if (clicked_canvas) {
+                canvas.selected.reset();
+                inspector_visible = false;
+            }
+            if (delete_text) {
+                canvas.texts.erase(canvas.texts.begin() + static_cast<std::ptrdiff_t>(index));
+                canvas.selected.reset();
+                inspector_visible = false;
+                canvas.normalize();
+                canvas.dirty = true;
+                redraw = true;
+            } else if (style_changed) {
+                measure(text);
+                canvas.dirty = true;
+                redraw = true;
+            }
+        }
+
+        if (canvas.pictures.empty() && canvas.texts.empty() && pending == Action::none && error.empty()) {
             constexpr auto title = "DROP PNG IMAGES";
-            constexpr auto detail = "DROP A VISIA FILE TO OPEN IT";
+            constexpr auto detail = "DOUBLE-CLICK TO ADD TEXT  \xC2\xB7  DROP A VISIA FILE TO OPEN";
             const auto center = ImVec2{io.DisplaySize.x * 0.5F, io.DisplaySize.y * 0.5F};
             const auto title_size = ImGui::CalcTextSize(title);
             const auto detail_size = ImGui::CalcTextSize(detail);
-            auto* background = ImGui::GetBackgroundDrawList();
             background->AddText(ImVec2{center.x - title_size.x * 0.5F, center.y + 50 * ui.scale}, IM_COL32(150, 155, 173, 255), title);
             background->AddText(ImVec2{center.x - detail_size.x * 0.5F, center.y + 80 * ui.scale}, IM_COL32(89, 95, 110, 255), detail);
         }
-        if (!canvas.pictures.empty() && pending == Action::none && error.empty()) {
+        if ((!canvas.pictures.empty() || !canvas.texts.empty()) && pending == Action::none && error.empty()) {
             const double percent = canvas.zoom * 100;
             const auto label = percent < 1 ? std::format("Fit \xC2\xB7 {:.2f}%", percent) : std::format("Fit \xC2\xB7 {:.0f}%", percent);
             const auto text_size = ImGui::CalcTextSize(label.c_str());
@@ -250,8 +585,9 @@ namespace visia {
             const bool hovered = ImGui::IsItemHovered();
             const ImVec2 text_position{origin.x + (size.x - text_size.x) / 2, origin.y + (size.y - text_size.y) / 2};
             draw->AddText({text_position.x, text_position.y + ui.scale}, IM_COL32(0, 0, 0, 179), label.c_str());
-            draw->AddText(text_position, hovered ? IM_COL32(225, 225, 237, 255) : IM_COL32(145, 148, 163, 255), label.c_str());
-            if (hovered) ImGui::SetTooltip("Left-click: 100%%\nMiddle-click or F: fit all images");
+            const ImU32 fit_ink = hovered ? IM_COL32(225, 225, 237, 255) : IM_COL32(145, 148, 163, 255);
+            draw->AddText(text_position, fit_ink, label.c_str());
+            if (hovered) ImGui::SetTooltip("Left-click: 100%%\nMiddle-click or F: fit all content");
             if (clicked) {
                 canvas.release();
                 canvas.zoom = 1;
@@ -314,7 +650,10 @@ namespace visia {
         while (running) {
             if (glfwWindowShouldClose(source)) {
                 glfwSetWindowShouldClose(source, GLFW_FALSE);
-                if (pending == Action::none && error.empty()) request(Action::close);
+                if (pending == Action::none && error.empty()) {
+                    shortcut = Shortcut::close;
+                    redraw = true;
+                }
             }
             if (redraw) {
                 redraw = false;
@@ -323,7 +662,9 @@ namespace visia {
                 redraw = !renderer.draw(canvas) || redraw;
                 if (redraw) continue;
             }
-            glfwWaitEvents();
+            if (editing) glfwWaitEventsTimeout(1.0 / 30);
+            else glfwWaitEvents();
+            if (editing) redraw = true;
         }
     }
 }

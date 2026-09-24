@@ -128,7 +128,22 @@ namespace visia {
             canvas.next_id = std::max(canvas.next_id, picture.id + 1);
             canvas.pictures.push_back(std::move(picture));
         }
-        if (!canvas.pictures.empty()) {
+        for (const auto& item : manifest.at("texts")) {
+            TextBlock text;
+            text.id = item.at("id").get<std::uint64_t>();
+            text.content = item.at("content").get<std::string>();
+            text.x = item.at("x").get<double>();
+            text.y = item.at("y").get<double>();
+            text.width = item.at("width").get<double>();
+            text.auto_width = item.at("auto_width").get<bool>();
+            text.font_size = item.at("font_size").get<int>();
+            text.weight = static_cast<TextBlock::Weight>(item.at("font_weight").get<int>());
+            text.alignment = static_cast<TextBlock::Alignment>(item.at("alignment").get<int>());
+            text.color = item.at("color").get<std::array<std::uint8_t, 3>>();
+            canvas.next_id = std::max(canvas.next_id, text.id + 1);
+            canvas.texts.push_back(std::move(text));
+        }
+        if (!canvas.pictures.empty() || !canvas.texts.empty()) {
             canvas.center_x = manifest.at("camera").at("x").get<double>();
             canvas.center_y = manifest.at("camera").at("y").get<double>();
             canvas.zoom = manifest.at("camera").at("zoom").get<double>();
@@ -141,13 +156,15 @@ namespace visia {
         auto temporary = path;
         temporary += L".tmp";
         ArchiveWriter archive{temporary};
-        const bool empty = canvas.pictures.empty();
-        nlohmann::json manifest{{"version", 1}, {"camera", {{"x", empty ? 0.0 : canvas.center_x}, {"y", empty ? 0.0 : canvas.center_y}, {"zoom", empty ? 1.0 : canvas.zoom}}}, {"pictures", nlohmann::json::array()}};
+        const bool empty = canvas.pictures.empty() && canvas.texts.empty();
+        nlohmann::json manifest{{"version", 1}, {"camera", {{"x", empty ? 0.0 : canvas.center_x}, {"y", empty ? 0.0 : canvas.center_y}, {"zoom", empty ? 1.0 : canvas.zoom}}}, {"pictures", nlohmann::json::array()}, {"texts", nlohmann::json::array()}};
         for (const auto& picture : canvas.pictures) {
             const auto name = std::format("images/{}.png", picture.id);
             archive.add(name, picture.png.data(), picture.png.size());
             manifest["pictures"].push_back({{"id", picture.id}, {"width", picture.width}, {"height", picture.height}, {"x", picture.x}, {"y", picture.y}, {"scale", picture.scale}});
         }
+        for (const auto& text : canvas.texts)
+            manifest["texts"].push_back({{"id", text.id}, {"content", text.content}, {"x", text.x}, {"y", text.y}, {"width", text.width}, {"auto_width", text.auto_width}, {"font_size", text.font_size}, {"font_weight", static_cast<int>(text.weight)}, {"alignment", static_cast<int>(text.alignment)}, {"color", text.color}});
         const auto description = manifest.dump(2);
         archive.add("manifest.json", description.data(), description.size());
         archive.finish();

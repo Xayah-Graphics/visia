@@ -34,6 +34,7 @@ visia_require_dependency(miniz)
 visia_require_dependency(nlohmann_json)
 visia_require_dependency(nfd)
 visia_require_dependency(imgui)
+visia_require_dependency(font)
 include(cmake/Shaders.cmake)
 
 # ============================================================================
@@ -56,5 +57,9 @@ target_sources(visia
         visia/app.ixx)
 target_link_libraries(visia PRIVATE visia_vulkan glfw nfd visia_stb visia_miniz visia_imgui nlohmann_json::nlohmann_json dwmapi)
 target_compile_definitions(visia PRIVATE GLFW_INCLUDE_NONE VISIA_SHADER_DIRECTORY="${VISIA_SHADER_OUTPUT_DIRECTORY}")
-target_link_options(visia PRIVATE /SUBSYSTEM:WINDOWS /ENTRY:mainCRTStartup)
 add_dependencies(visia visia_shaders)
+add_custom_command(TARGET visia POST_BUILD
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${VISIA_FONT_DIRECTORY}/NotoSansSC-Regular.otf" "$<TARGET_FILE_DIR:visia>/NotoSansSC-Regular.otf"
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${VISIA_FONT_DIRECTORY}/NotoSansSC-Bold.otf" "$<TARGET_FILE_DIR:visia>/NotoSansSC-Bold.otf"
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${VISIA_FONT_DIRECTORY}/NotoCJK-LICENSE.txt" "$<TARGET_FILE_DIR:visia>/NotoCJK-LICENSE.txt"
+        VERBATIM)

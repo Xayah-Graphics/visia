@@ -42,6 +42,28 @@ namespace visia {
         RemovePropW(native_window, L"VisiaWindow");
     }
 
+    void WindowPlatform::toggle_fullscreen() {
+        if (!fullscreen) {
+            windowed_style = GetWindowLongPtrW(native_window, GWL_STYLE);
+            GetWindowPlacement(native_window, &windowed_placement);
+            MONITORINFO monitor{sizeof(MONITORINFO)};
+            GetMonitorInfoW(MonitorFromWindow(native_window, MONITOR_DEFAULTTONEAREST), &monitor);
+            fullscreen = true;
+            SetWindowLongPtrW(native_window, GWL_STYLE, windowed_style & ~(WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_SYSMENU | WS_MAXIMIZE));
+            constexpr DWM_WINDOW_CORNER_PREFERENCE corners = DWMWCP_DONOTROUND;
+            DwmSetWindowAttribute(native_window, DWMWA_WINDOW_CORNER_PREFERENCE, &corners, sizeof(corners));
+            const auto& area = monitor.rcMonitor;
+            SetWindowPos(native_window, HWND_TOP, area.left, area.top, area.right - area.left, area.bottom - area.top, SWP_FRAMECHANGED | SWP_NOOWNERZORDER);
+        } else {
+            fullscreen = false;
+            SetWindowLongPtrW(native_window, GWL_STYLE, windowed_style);
+            SetWindowPlacement(native_window, &windowed_placement);
+            constexpr DWM_WINDOW_CORNER_PREFERENCE corners = DWMWCP_ROUND;
+            DwmSetWindowAttribute(native_window, DWMWA_WINDOW_CORNER_PREFERENCE, &corners, sizeof(corners));
+            SetWindowPos(native_window, nullptr, 0, 0, 0, 0, SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_NOACTIVATE);
+        }
+    }
+
     LRESULT CALLBACK WindowPlatform::window_proc(HWND window, const UINT message, const WPARAM wparam, const LPARAM lparam) {
         auto* platform = static_cast<WindowPlatform*>(GetPropW(window, L"VisiaWindow"));
         if (!platform) return DefWindowProcW(window, message, wparam, lparam);
@@ -51,6 +73,7 @@ namespace visia {
             break;
         case WM_NCHITTEST:
             {
+                if (platform->fullscreen) return HTCLIENT;
                 POINT point{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
                 ScreenToClient(window, &point);
                 RECT client{};
@@ -71,6 +94,7 @@ namespace visia {
                 }
                 if (point.y >= 0 && point.y < MulDiv(48, GetDpiForWindow(window), 96)) {
                     const auto [world_x, world_y] = platform->canvas.world(point.x, point.y);
+                    if (platform->canvas.text_at(world_x, world_y)) return HTCLIENT;
                     for (const auto& picture : platform->canvas.pictures)
                         if (world_x >= picture.x && world_y >= picture.y && world_x <= picture.x + picture.width * picture.scale && world_y <= picture.y + picture.height * picture.scale) return HTCLIENT;
                     return HTCAPTION;
@@ -82,8 +106,9 @@ namespace visia {
                 MONITORINFO monitor{sizeof(MONITORINFO)};
                 GetMonitorInfoW(MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST), &monitor);
                 auto& size = *reinterpret_cast<MINMAXINFO*>(lparam);
-                size.ptMaxPosition = {monitor.rcWork.left - monitor.rcMonitor.left, monitor.rcWork.top - monitor.rcMonitor.top};
-                size.ptMaxSize = {monitor.rcWork.right - monitor.rcWork.left, monitor.rcWork.bottom - monitor.rcWork.top};
+                const auto& area = platform->fullscreen ? monitor.rcMonitor : monitor.rcWork;
+                size.ptMaxPosition = {area.left - monitor.rcMonitor.left, area.top - monitor.rcMonitor.top};
+                size.ptMaxSize = {area.right - area.left, area.bottom - area.top};
                 return 0;
             }
         }
