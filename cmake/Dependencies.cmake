@@ -1,0 +1,7 @@
+include_guard(GLOBAL)
+include(FetchContent)
+set(FETCHCONTENT_TRY_FIND_PACKAGE_MODE NEVER)
+set(VISIA_DEPENDENCIES_DIRECTORY "${CMAKE_CURRENT_LIST_DIR}/dependencies")
+macro(visia_require_dependency dependency)
+    include("${VISIA_DEPENDENCIES_DIRECTORY}/${dependency}.cmake")
+endmacro()
