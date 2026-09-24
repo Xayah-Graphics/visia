@@ -1,0 +1,11 @@
+.idea
+.venv
+cmake-build-*
+build*
+/install/
+/data/
+/assets/weights/
+/assets/prompts/
+AGENTS.md
+TODO.md
+/exports/
