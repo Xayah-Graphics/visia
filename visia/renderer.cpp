@@ -67,7 +67,7 @@ namespace visia {
             vk::DescriptorPoolSize{vk::DescriptorType::eSampledImage, 256},
             vk::DescriptorPoolSize{vk::DescriptorType::eSampler, 256}};
         descriptor_pool = vk::raii::DescriptorPool{device, vk::DescriptorPoolCreateInfo{vk::DescriptorPoolCreateFlagBits::eFreeDescriptorSet, 256, static_cast<std::uint32_t>(pool_sizes.size()), pool_sizes.data()}};
-        static_assert(sizeof(PushData) == 56);
+        static_assert(sizeof(PushData) == 64);
         const vk::PushConstantRange push{vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment, 0, sizeof(PushData)};
         grid_layout = vk::raii::PipelineLayout{device, vk::PipelineLayoutCreateInfo{{}, 0, nullptr, 1, &push}};
         const auto layout = *texture_layout;
@@ -77,6 +77,7 @@ namespace visia {
         picture_pipeline = pipeline("picture", picture_layout, true);
         shadow_pipeline = pipeline("shadow", shape_layout, true);
         shape_pipeline = pipeline("shape", shape_layout, true);
+        group_pipeline = pipeline("group", shape_layout, true);
         recreate();
         constexpr VkFormat color_format = VK_FORMAT_B8G8R8A8_SRGB;
         ImGui_ImplVulkan_InitInfo ui{};
@@ -158,6 +159,30 @@ namespace visia {
         command.pushConstants(*grid_layout, stages, 0, sizeof(PushData), &push);
         command.draw(3, 1, 0, 0);
 
+        const auto draw_groups = [&](auto&& self, const std::uint64_t parent, const bool fill) -> void {
+            for (std::size_t i = 0; i < canvas.groups.size(); ++i) {
+                const auto& group = canvas.groups[i];
+                if (group.parent != parent) continue;
+                const bool target = group.id == canvas.drop_target;
+                if (!fill || group.background || target) {
+                    const auto box = canvas.bounds({Selection::Kind::group, i});
+                    const auto [left, top] = canvas.screen(box[0], box[1]);
+                    push.rect = {static_cast<float>(left * dpi_x), static_cast<float>(top * dpi_y),
+                        static_cast<float>((box[2] - box[0]) * canvas.zoom * dpi_x),
+                        static_cast<float>((box[3] - box[1]) * canvas.zoom * dpi_y)};
+                    const auto& tint = Group::palette[group.color];
+                    const bool emphasized = !fill && std::ranges::find(canvas.selected, Selection{Selection::Kind::group, i}) != canvas.selected.end();
+                    push.color = {tint[0], tint[1], tint[2], fill ? target ? 0.17F : 0.10F : target ? 1.0F : emphasized ? 0.98F : 0.82F};
+                    push.group_style = {9 * dpi_x, fill ? 0.0F : target ? 4.0F * dpi_x : emphasized ? 2.5F * dpi_x : 1.5F * dpi_x};
+                    command.bindPipeline(vk::PipelineBindPoint::eGraphics, *group_pipeline);
+                    command.pushConstants(*shape_layout, stages, 0, sizeof(PushData), &push);
+                    command.draw(6, 1, 0, 0);
+                }
+                self(self, group.id, fill);
+            }
+        };
+        draw_groups(draw_groups, 0, true);
+
         for (const auto& picture : canvas.pictures) {
             const auto texture = textures.find(picture.id);
             if (texture == textures.end() || texture->second.last_used != frame_number) continue;
@@ -177,8 +202,10 @@ namespace visia {
             command.draw(6, 1, 0, 0);
         }
 
-        if (canvas.selected && canvas.selected->kind == Selection::Kind::picture) {
-            const auto& picture = canvas.pictures[canvas.selected->index];
+        draw_groups(draw_groups, 0, false);
+        for (const auto item : canvas.selected) {
+            if (item.kind != Selection::Kind::picture) continue;
+            const auto& picture = canvas.pictures[item.index];
             const auto [left, top] = canvas.screen(picture.x, picture.y);
             const float x = static_cast<float>(left * dpi_x), y = static_cast<float>(top * dpi_y);
             const float w = static_cast<float>(picture.width * picture.scale * canvas.zoom * dpi_x);
@@ -194,14 +221,16 @@ namespace visia {
             rectangle(x, y + h - 1.25F, w, 1.25F);
             rectangle(x, y, 1.25F, h);
             rectangle(x + w - 1.25F, y, 1.25F, h);
-            rectangle(x - 2, y - 2, 5, 5);
-            push.color = {0.008F, 0.010F, 0.015F, 1};
-            rectangle(x + w - 5, y + h - 5, 10, 10);
-            push.color = {0.39F, 0.39F, 0.62F, 0.95F};
-            rectangle(x + w - 5, y + h - 5, 10, 1);
-            rectangle(x + w - 5, y + h + 4, 10, 1);
-            rectangle(x + w - 5, y + h - 5, 1, 10);
-            rectangle(x + w + 4, y + h - 5, 1, 10);
+            if (canvas.selected.size() == 1) {
+                rectangle(x - 2, y - 2, 5, 5);
+                push.color = {0.008F, 0.010F, 0.015F, 1};
+                rectangle(x + w - 5, y + h - 5, 10, 10);
+                push.color = {0.39F, 0.39F, 0.62F, 0.95F};
+                rectangle(x + w - 5, y + h - 5, 10, 1);
+                rectangle(x + w - 5, y + h + 4, 10, 1);
+                rectangle(x + w - 5, y + h - 5, 1, 10);
+                rectangle(x + w + 4, y + h - 5, 1, 10);
+            }
         }
         ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), static_cast<VkCommandBuffer>(*command));
         command.endRendering();
@@ -229,6 +258,15 @@ namespace visia {
         device.waitIdle();
         textures.clear();
         for (auto& frame : frames) frame.staging.clear();
+    }
+
+    void Renderer::prune(const Canvas& canvas) {
+        const auto obsolete = [&](const auto& entry) {
+            return std::ranges::find(canvas.pictures, entry.first, &Picture::id) == canvas.pictures.end();
+        };
+        if (std::ranges::none_of(textures, obsolete)) return;
+        device.waitIdle();
+        std::erase_if(textures, obsolete);
     }
 
     void Renderer::recreate() {

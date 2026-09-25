@@ -9,6 +9,7 @@ module;
 
 module visia.app;
 import visia.canvas;
+import visia.clipboard;
 import visia.document;
 import visia.renderer;
 import visia.window;
@@ -109,10 +110,14 @@ namespace visia {
             const bool inside_inspector = app.inspector_visible &&
                 x >= app.inspector_bounds[0] && y >= app.inspector_bounds[1] &&
                 x <= app.inspector_bounds[2] && y <= app.inspector_bounds[3];
+            const bool inside_group_toolbar = app.group_toolbar_visible &&
+                x >= app.group_toolbar_bounds[0] && y >= app.group_toolbar_bounds[1] &&
+                x <= app.group_toolbar_bounds[2] && y <= app.group_toolbar_bounds[3];
             if (action == GLFW_RELEASE) {
                 app.canvas.release();
-                if (button == GLFW_MOUSE_BUTTON_LEFT && !inside_inspector && !app.editing && !ImGui::GetIO().WantCaptureMouse) {
-                    app.inspector_visible = app.canvas.selected && app.canvas.selected->kind == Selection::Kind::text;
+                if (button == GLFW_MOUSE_BUTTON_LEFT && !inside_inspector && !inside_group_toolbar && !app.editing && !ImGui::GetIO().WantCaptureMouse) {
+                    app.inspector_visible = app.canvas.selected.size() == 1 && app.canvas.selected.front().kind == Selection::Kind::text;
+                    app.group_toolbar_visible = !app.inspector_visible && !app.canvas.selected.empty();
                 }
                 return;
             }
@@ -123,15 +128,19 @@ namespace visia {
                 const double height = text.height * app.canvas.zoom;
                 if (x < left || y < top || x > left + width || y > top + height) {
                     app.finish_edit(true);
-                    app.canvas.selected.reset();
+                    app.canvas.selected.clear();
                     app.inspector_visible = false;
+                    app.group_toolbar_visible = false;
                 }
                 return;
             }
-            if (button == GLFW_MOUSE_BUTTON_LEFT && inside_inspector) return;
+            if (button == GLFW_MOUSE_BUTTON_LEFT && (inside_inspector || inside_group_toolbar)) return;
             if (app.pending != Action::none || !app.error.empty() || app.editing || ImGui::GetIO().WantCaptureMouse) return;
             if (action != GLFW_PRESS) return;
-            if (button == GLFW_MOUSE_BUTTON_LEFT) app.inspector_visible = false;
+            if (button == GLFW_MOUSE_BUTTON_LEFT) {
+                app.inspector_visible = false;
+                app.group_toolbar_visible = false;
+            }
             if (button == GLFW_MOUSE_BUTTON_LEFT || button == GLFW_MOUSE_BUTTON_MIDDLE) app.canvas.press(x, y, button, (modifiers & GLFW_MOD_ALT) != 0);
         });
         glfwSetScrollCallback(source, [](GLFWwindow* source, double, const double steps) {
@@ -155,11 +164,16 @@ namespace visia {
             auto& app = *static_cast<Application*>(glfwGetWindowUserPointer(source));
             app.redraw = true;
             if (app.pending != Action::none || !app.error.empty() || (modifiers & (GLFW_MOD_SHIFT | GLFW_MOD_ALT | GLFW_MOD_SUPER))) return;
-            if (key == GLFW_KEY_ESCAPE && !(modifiers & GLFW_MOD_CONTROL) && app.editing) app.shortcut = Shortcut::cancel_edit;
+            if (key == GLFW_KEY_ESCAPE && !(modifiers & GLFW_MOD_CONTROL)) {
+                if (app.editing) app.shortcut = Shortcut::cancel_edit;
+            }
             else if (key == GLFW_KEY_F11 && !(modifiers & GLFW_MOD_CONTROL)) app.window.toggle_fullscreen();
             else if (key == GLFW_KEY_W && (modifiers & GLFW_MOD_CONTROL)) app.shortcut = Shortcut::close;
             else if (key == GLFW_KEY_S && (modifiers & GLFW_MOD_CONTROL)) app.shortcut = Shortcut::save;
+            else if (key == GLFW_KEY_C && (modifiers & GLFW_MOD_CONTROL) && !app.editing && !ImGui::GetIO().WantTextInput) app.shortcut = Shortcut::copy;
+            else if (key == GLFW_KEY_V && (modifiers & GLFW_MOD_CONTROL) && !app.editing && !ImGui::GetIO().WantTextInput) app.shortcut = Shortcut::paste;
             else if (key == GLFW_KEY_F && !(modifiers & GLFW_MOD_CONTROL) && !app.editing) app.shortcut = Shortcut::fit;
+            else if ((key == GLFW_KEY_DELETE || key == GLFW_KEY_KP_DECIMAL) && !(modifiers & GLFW_MOD_CONTROL) && !app.editing && !ImGui::GetIO().WantTextInput) app.shortcut = Shortcut::delete_selection;
         });
         ui.attach(source);
         glfwShowWindow(source);
@@ -170,6 +184,7 @@ namespace visia {
         renderer.clear();
         canvas = std::move(opened);
         inspector_visible = false;
+        group_toolbar_visible = false;
         int width{}, height{};
         glfwGetWindowSize(window.handle.get(), &width, &height);
         canvas.viewport_width = width;
@@ -200,8 +215,9 @@ namespace visia {
         original_text = canvas.texts[index].content;
         new_text = created;
         focus_text = true;
-        canvas.selected = Selection{Selection::Kind::text, index};
+        canvas.selected = {{Selection::Kind::text, index}};
         inspector_visible = false;
+        group_toolbar_visible = false;
         canvas.release();
         redraw = true;
     }
@@ -214,7 +230,8 @@ namespace visia {
         if (!commit && !new_text) text.content = original_text;
         if (remove) {
             canvas.texts.erase(canvas.texts.begin() + static_cast<std::ptrdiff_t>(index));
-            canvas.selected.reset();
+            canvas.selected.clear();
+            canvas.remove_empty_groups();
             canvas.normalize();
             if (commit && !new_text) canvas.dirty = true;
         } else if (commit && (new_text || text.content != original_text)) canvas.dirty = true;
@@ -229,6 +246,7 @@ namespace visia {
     void Application::handle_drop() {
         auto files = std::exchange(dropped_files, {});
         inspector_visible = false;
+        group_toolbar_visible = false;
         try {
             const auto document = std::ranges::find_if(files, [](const std::filesystem::path& file) {
                 auto extension = file.extension().wstring();
@@ -243,8 +261,9 @@ namespace visia {
             std::vector<Picture> pictures;
             for (const auto& file : files) pictures.push_back(read_png(file));
             auto position = canvas.world(drop_position[0], drop_position[1]);
+            const auto parent = canvas.group_at(position[0], position[1]);
             for (auto& picture : pictures) {
-                canvas.add(std::move(picture.png), picture.width, picture.height, position[0], position[1]);
+                canvas.add(std::move(picture.png), picture.width, picture.height, position[0], position[1], parent);
                 const auto& placed = canvas.pictures.back();
                 position[0] = Canvas::snap(placed.x + placed.width * placed.scale) + Canvas::grid;
             }
@@ -287,6 +306,29 @@ namespace visia {
         const auto command = std::exchange(shortcut, Shortcut::none);
         ui.begin(window.handle.get());
         const auto& io = ImGui::GetIO();
+        if (command == Shortcut::delete_selection) {
+            canvas.delete_selection();
+            renderer.prune(canvas);
+            inspector_visible = false;
+            group_toolbar_visible = false;
+        }
+        if (command == Shortcut::copy || command == Shortcut::paste) {
+            try {
+                canvas.release();
+                if (command == Shortcut::copy) copy_selection(canvas, window.handle.get());
+                else {
+                    double screen_x{}, screen_y{};
+                    glfwGetCursorPos(window.handle.get(), &screen_x, &screen_y);
+                    const auto [world_x, world_y] = canvas.world(screen_x, screen_y);
+                    paste_selection(canvas, window.handle.get(), world_x, world_y);
+                    inspector_visible = canvas.selected.size() == 1 && canvas.selected.front().kind == Selection::Kind::text;
+                    group_toolbar_visible = !inspector_visible && !canvas.selected.empty();
+                    redraw = true;
+                }
+            } catch (const std::exception& failure) {
+                error = failure.what();
+            }
+        }
         const auto font_for = [&](const TextBlock& text) {
             return ui.text_fonts[static_cast<std::size_t>(text.weight)];
         };
@@ -303,15 +345,12 @@ namespace visia {
         if (!editing && pending == Action::none && error.empty() && !io.KeyAlt && !io.WantCaptureMouse && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
             const auto [world_x, world_y] = canvas.world(io.MousePos.x, io.MousePos.y);
             if (const auto hit = canvas.text_at(world_x, world_y)) start_edit(*hit, false);
-            else {
-                bool on_picture{};
-                for (const auto& picture : canvas.pictures)
-                    if (world_x >= picture.x && world_y >= picture.y && world_x <= picture.x + picture.width * picture.scale && world_y <= picture.y + picture.height * picture.scale) on_picture = true;
-                if (!on_picture) {
-                    canvas.add_text(world_x, world_y);
-                    canvas.normalize();
-                    start_edit(canvas.texts.size() - 1, true);
-                }
+            else if (canvas.selected.empty() || canvas.selected.front().kind == Selection::Kind::group) {
+                canvas.release();
+                const auto [create_x, create_y] = canvas.world(io.MousePos.x, io.MousePos.y);
+                canvas.add_text(create_x, create_y);
+                canvas.normalize();
+                start_edit(canvas.texts.size() - 1, true);
             }
         }
         if (editing) {
@@ -395,18 +434,27 @@ namespace visia {
                 line_y += font_size;
             }
             ImGui::PopFont();
-            if (canvas.selected && canvas.selected->kind == Selection::Kind::text && canvas.selected->index == index) {
+            if (std::ranges::find(canvas.selected, Selection{Selection::Kind::text, index}) != canvas.selected.end()) {
                 background->AddRect({static_cast<float>(x), static_cast<float>(y)}, {static_cast<float>(x) + width, static_cast<float>(y) + height}, IM_COL32(122, 139, 180, 220), 2 * ui.scale);
-                const ImVec2 handle{static_cast<float>(x) + width, static_cast<float>(y) + height / 2};
-                background->AddCircleFilled(handle, 4 * ui.scale, IM_COL32(174, 187, 218, 245));
+                if (canvas.selected.size() == 1) {
+                    const ImVec2 handle{static_cast<float>(x) + width, static_cast<float>(y) + height / 2};
+                    background->AddCircleFilled(handle, 4 * ui.scale, IM_COL32(174, 187, 218, 245));
+                }
             }
         }
 
-        if (inspector_visible && !editing && canvas.selected && canvas.selected->kind == Selection::Kind::text && pending == Action::none && error.empty()) {
-            const std::size_t index = canvas.selected->index;
+        if (canvas.marquee) {
+            const auto [left, top] = canvas.screen((*canvas.marquee)[0], (*canvas.marquee)[1]);
+            const auto [right, bottom] = canvas.screen((*canvas.marquee)[2], (*canvas.marquee)[3]);
+            background->AddRectFilled({static_cast<float>(left), static_cast<float>(top)}, {static_cast<float>(right), static_cast<float>(bottom)}, IM_COL32(123, 146, 192, 25));
+            background->AddRect({static_cast<float>(left), static_cast<float>(top)}, {static_cast<float>(right), static_cast<float>(bottom)}, IM_COL32(132, 156, 204, 185), 1.5F * ui.scale);
+        }
+
+        if (inspector_visible && !editing && canvas.selected.size() == 1 && canvas.selected.front().kind == Selection::Kind::text && pending == Action::none && error.empty()) {
+            const std::size_t index = canvas.selected.front().index;
             auto& text = canvas.texts[index];
             const auto [screen_x, screen_y] = canvas.screen(text.x, text.y);
-            const float width = 300 * ui.scale, height = 80 * ui.scale;
+            const float width = 300 * ui.scale, height = 116 * ui.scale;
             const float x = std::clamp(static_cast<float>(screen_x + text.width * canvas.zoom / 2 - width / 2), 16 * ui.scale, std::max(16 * ui.scale, io.DisplaySize.x - width - 16 * ui.scale));
             const float above = static_cast<float>(screen_y) - height - 10 * ui.scale;
             const float below = static_cast<float>(screen_y + text.height * canvas.zoom) + 10 * ui.scale;
@@ -431,7 +479,7 @@ namespace visia {
             ImGui::PushStyleColor(ImGuiCol_Button, ImVec4{0.12F, 0.13F, 0.16F, 1});
             ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4{0.22F, 0.23F, 0.28F, 1});
             ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4{0.28F, 0.30F, 0.37F, 1});
-            bool style_changed{}, delete_text{};
+            bool style_changed{}, delete_text{}, create_group{};
             ImGui::Begin("##TextInspector", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoResize);
             const bool clicked_canvas = ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
                 !ImGui::IsWindowHovered(ImGuiHoveredFlags_AnyWindow) &&
@@ -539,27 +587,105 @@ namespace visia {
             ImGui::PushStyleColor(ImGuiCol_Text, ImVec4{0.87F, 0.56F, 0.56F, 1});
             delete_text = ImGui::Button("Delete", ImVec2{54 * ui.scale, 0});
             ImGui::PopStyleColor();
+            create_group = ImGui::Button("Group", ImVec2{(width - 22 * ui.scale), 25 * ui.scale});
             ImGui::End();
             ImGui::PopStyleColor(9);
             ImGui::PopStyleVar(7);
             if (clicked_canvas) {
-                canvas.selected.reset();
+                canvas.selected.clear();
                 inspector_visible = false;
             }
             if (delete_text) {
-                canvas.texts.erase(canvas.texts.begin() + static_cast<std::ptrdiff_t>(index));
-                canvas.selected.reset();
+                canvas.delete_selection();
                 inspector_visible = false;
-                canvas.normalize();
-                canvas.dirty = true;
                 redraw = true;
             } else if (style_changed) {
                 measure(text);
                 canvas.dirty = true;
                 redraw = true;
             }
+            if (create_group) {
+                canvas.group_selection();
+                inspector_visible = false;
+                group_toolbar_visible = true;
+            }
         }
 
+        if (group_toolbar_visible && !editing && !canvas.selected.empty() && pending == Action::none && error.empty()) {
+            const bool one_group = canvas.selected.size() == 1 && canvas.selected.front().kind == Selection::Kind::group;
+            std::array<double, 4> box{std::numeric_limits<double>::max(), std::numeric_limits<double>::max(), std::numeric_limits<double>::lowest(), std::numeric_limits<double>::lowest()};
+            for (const auto item : canvas.selected) {
+                const auto item_box = canvas.bounds(item);
+                box[0] = std::min(box[0], item_box[0]);
+                box[1] = std::min(box[1], item_box[1]);
+                box[2] = std::max(box[2], item_box[2]);
+                box[3] = std::max(box[3], item_box[3]);
+            }
+            const auto [left, top] = canvas.screen(box[0], box[1]);
+            const auto [right, bottom] = canvas.screen(box[2], box[3]);
+            const float width = (one_group ? 276.0F : 112.0F) * ui.scale;
+            const float height = (one_group ? 76.0F : 46.0F) * ui.scale;
+            const float x = std::clamp(static_cast<float>((left + right) / 2 - width / 2), 16 * ui.scale, std::max(16 * ui.scale, io.DisplaySize.x - width - 16 * ui.scale));
+            const float above = static_cast<float>(top) - height - 10 * ui.scale;
+            const float below = static_cast<float>(bottom) + 10 * ui.scale;
+            const float y = std::clamp(above >= 16 * ui.scale ? above : below, 16 * ui.scale, std::max(16 * ui.scale, io.DisplaySize.y - height - 16 * ui.scale));
+            group_toolbar_bounds = {x, y, x + width, y + height};
+            background->AddRectFilled({x, y + 3 * ui.scale}, {x + width, y + height + 3 * ui.scale}, IM_COL32(0, 0, 0, 35), 10 * ui.scale);
+            ImGui::SetNextWindowPos({x, y});
+            ImGui::SetNextWindowSize({width, height});
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {9 * ui.scale, 8 * ui.scale});
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 10 * ui.scale);
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, ui.scale);
+            ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, {7 * ui.scale, 6 * ui.scale});
+            ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6 * ui.scale);
+            ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, {7 * ui.scale, 4 * ui.scale});
+            ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4{0.12F, 0.13F, 0.16F, 0.98F});
+            ImGui::PushStyleColor(ImGuiCol_Border, ImVec4{0.32F, 0.34F, 0.39F, 0.8F});
+            bool create_group{}, ungroup{}, background_changed{};
+            std::optional<std::size_t> next_color;
+            ImGui::Begin("##GroupToolbar", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoResize);
+            if (one_group) {
+                auto& group = canvas.groups[canvas.selected.front().index];
+                ImGui::TextDisabled("GROUP");
+                ImGui::SameLine();
+                for (std::size_t color = 0; color < Group::palette.size(); ++color) {
+                    if (color) ImGui::SameLine(0, 5 * ui.scale);
+                    bool conflict = group.parent && canvas.groups[static_cast<std::size_t>(std::ranges::find(canvas.groups, group.parent, &Group::id) - canvas.groups.begin())].color == color;
+                    for (const auto& child : canvas.groups)
+                        if (child.parent == group.id && child.color == color) conflict = true;
+                    ImGui::BeginDisabled(conflict);
+                    ImGui::PushID(static_cast<int>(color));
+                    const auto& tint = Group::palette[color];
+                    if (ImGui::ColorButton("##GroupColor", {tint[0], tint[1], tint[2], 1}, ImGuiColorEditFlags_NoTooltip, {23 * ui.scale, 23 * ui.scale})) next_color = color;
+                    if (group.color == color) ImGui::GetWindowDrawList()->AddRect(ImGui::GetItemRectMin(), ImGui::GetItemRectMax(), IM_COL32(235, 238, 246, 255), 3 * ui.scale, 0, 1.5F * ui.scale);
+                    ImGui::PopID();
+                    ImGui::EndDisabled();
+                }
+                const float action_width = (width - 25 * ui.scale) / 2;
+                background_changed = ImGui::Button(group.background ? "Background on" : "Background off", {action_width, 27 * ui.scale});
+                ImGui::SameLine();
+                ungroup = ImGui::Button("Ungroup", {action_width, 27 * ui.scale});
+            } else create_group = ImGui::Button("Group", {92 * ui.scale, 27 * ui.scale});
+            ImGui::End();
+            ImGui::PopStyleColor(2);
+            ImGui::PopStyleVar(6);
+            if (one_group) {
+                if (next_color) {
+                    canvas.groups[canvas.selected.front().index].color = *next_color;
+                    canvas.dirty = true;
+                }
+                if (background_changed) {
+                    auto& group = canvas.groups[canvas.selected.front().index];
+                    group.background = !group.background;
+                    canvas.dirty = true;
+                }
+                if (ungroup) {
+                    canvas.ungroup(canvas.selected.front().index);
+                    group_toolbar_visible = false;
+                }
+            }
+            if (create_group) canvas.group_selection();
+        }
         if (canvas.pictures.empty() && canvas.texts.empty() && pending == Action::none && error.empty()) {
             constexpr auto title = "DROP PNG IMAGES";
             constexpr auto detail = "DOUBLE-CLICK TO ADD TEXT  \xC2\xB7  DROP A VISIA FILE TO OPEN";

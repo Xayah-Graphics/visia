@@ -36,9 +36,11 @@ export namespace visia {
         bool new_text{}, focus_text{};
         bool inspector_visible{};
         std::array<float, 4> inspector_bounds{};
+        bool group_toolbar_visible{};
+        std::array<float, 4> group_toolbar_bounds{};
         std::vector<std::filesystem::path> dropped_files;
         std::array<double, 2> drop_position{};
-        enum class Shortcut { none, save, close, cancel_edit, fit } shortcut{Shortcut::none};
+        enum class Shortcut { none, save, close, cancel_edit, fit, delete_selection, copy, paste } shortcut{Shortcut::none};
 
     public:
         Application();

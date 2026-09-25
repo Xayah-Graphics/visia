@@ -45,17 +45,20 @@ target_sources(visia
         PRIVATE
         main.cpp
         visia/canvas.cpp
+        visia/clipboard.cpp
         visia/document.cpp
         visia/window.cpp
         visia/renderer.cpp
         visia/app.cpp
         PRIVATE FILE_SET cxx_modules TYPE CXX_MODULES FILES
         visia/canvas.ixx
+        visia/clipboard.ixx
         visia/document.ixx
         visia/window.ixx
         visia/renderer.ixx
         visia/app.ixx)
 target_link_libraries(visia PRIVATE visia_vulkan glfw nfd visia_stb visia_miniz visia_imgui nlohmann_json::nlohmann_json dwmapi)
+target_link_options(visia PRIVATE /SUBSYSTEM:WINDOWS /ENTRY:mainCRTStartup)
 target_compile_definitions(visia PRIVATE GLFW_INCLUDE_NONE VISIA_SHADER_DIRECTORY="${VISIA_SHADER_OUTPUT_DIRECTORY}")
 add_dependencies(visia visia_shaders)
 add_custom_command(TARGET visia POST_BUILD

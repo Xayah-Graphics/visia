@@ -5,6 +5,7 @@ struct CanvasPush {
     float grid_opacity;
     float4 rect;
     float4 color;
+    float2 group_style;
 };
 
 [vk::push_constant]
@@ -80,4 +81,22 @@ VertexOutput shape_vertex(uint index : SV_VertexID) {
 [shader("fragment")]
 float4 shape_fragment(VertexOutput input) : SV_Target0 {
     return push_data.color;
+}
+
+[shader("vertex")]
+VertexOutput group_vertex(uint index : SV_VertexID) {
+    return rectangle_vertex(index);
+}
+
+[shader("fragment")]
+float4 group_fragment(VertexOutput input) : SV_Target0 {
+    float2 pixel = input.uv * push_data.rect.zw;
+    float2 half_size = push_data.rect.zw * 0.5f;
+    float radius = min(push_data.group_style.x, min(half_size.x, half_size.y));
+    float2 distance = abs(pixel - half_size) - (half_size - radius);
+    float signed_distance = length(max(distance, 0.0f)) + min(max(distance.x, distance.y), 0.0f) - radius;
+    float outer = 1.0f - smoothstep(-1.0f, 1.0f, signed_distance);
+    float coverage = push_data.group_style.y == 0.0f ? outer :
+        outer - (1.0f - smoothstep(-1.0f, 1.0f, signed_distance + push_data.group_style.y));
+    return float4(push_data.color.rgb, push_data.color.a * coverage);
 }

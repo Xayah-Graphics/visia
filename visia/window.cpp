@@ -97,6 +97,10 @@ namespace visia {
                     if (platform->canvas.text_at(world_x, world_y)) return HTCLIENT;
                     for (const auto& picture : platform->canvas.pictures)
                         if (world_x >= picture.x && world_y >= picture.y && world_x <= picture.x + picture.width * picture.scale && world_y <= picture.y + picture.height * picture.scale) return HTCLIENT;
+                    for (std::size_t i = 0; i < platform->canvas.groups.size(); ++i) {
+                        const auto box = platform->canvas.bounds({Selection::Kind::group, i});
+                        if (world_x >= box[0] && world_y >= box[1] && world_x <= box[2] && world_y <= box[3]) return HTCLIENT;
+                    }
                     return HTCAPTION;
                 }
                 return HTCLIENT;

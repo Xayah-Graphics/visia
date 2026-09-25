@@ -1,6 +1,6 @@
 set(VISIA_SHADER_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}/generated/shaders")
 set(VISIA_SHADER_BINARIES)
-foreach (shader IN ITEMS grid picture shadow shape)
+foreach (shader IN ITEMS grid picture shadow shape group)
     foreach (stage IN ITEMS vertex fragment)
         set(output "${VISIA_SHADER_OUTPUT_DIRECTORY}/${shader}_${stage}.spv")
         add_custom_command(OUTPUT "${output}"

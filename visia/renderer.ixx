@@ -15,6 +15,7 @@ export namespace visia {
 
         [[nodiscard]] bool draw(const Canvas& canvas);
         void clear();
+        void prune(const Canvas& canvas);
 
     private:
         struct Buffer {
@@ -44,6 +45,7 @@ export namespace visia {
             float spacing{}, grid_opacity{};
             std::array<float, 4> rect{};
             std::array<float, 4> color{};
+            std::array<float, 2> group_style{};
         };
 
         GLFWwindow* window{};
@@ -73,6 +75,7 @@ export namespace visia {
         vk::raii::Pipeline picture_pipeline{nullptr};
         vk::raii::Pipeline shadow_pipeline{nullptr};
         vk::raii::Pipeline shape_pipeline{nullptr};
+        vk::raii::Pipeline group_pipeline{nullptr};
         std::map<std::uint64_t, Texture> textures;
         std::size_t frame_index{};
         std::uint64_t frame_number{};
